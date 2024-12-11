@@ -2,7 +2,7 @@ import os
 from openai import OpenAI
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pytz import timezone
+import pytz
 from pytz.exceptions import UnknownTimeZoneError
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
@@ -109,9 +109,9 @@ def heuristic_classification(command: str) -> str:
     - Otherwise, assume 'date-time-interpretation'
     """
     cmd_lower = command.lower()
-    if any(keyword in cmd_lower for keyword in ["summarize", "spent my time", "what did my week look like", "last week", "this week", "next week"]):
+    if any(keyword in cmd_lower for keyword in ["summarize", "spent my time", "spend my time", "what did my week look like", "last week", "this week", "next week", "this month", "last month", "look like"]):
         return "meeting-summary"
-    elif any(keyword in cmd_lower for keyword in ["create", "schedule", "book", "set up"]):
+    elif any(keyword in cmd_lower for keyword in ["create", "schedule", "book", "set up", "block"]):
         return "create-event"
     else:
         return "date-time-interpretation"
@@ -148,7 +148,7 @@ def meeting_summary_command(request: CommandRequest):
     Generate a meeting summary based on user input, handling both past and future requests.
     """
     user_timezone = get_user_timezone()
-    user_tz = timezone(user_timezone)
+    user_tz = pytz.timezone(user_timezone)
 
     current_date = datetime.now(user_tz).strftime("%Y-%m-%d")
 
@@ -163,6 +163,11 @@ def meeting_summary_command(request: CommandRequest):
     - "last week" should mean the full calendar week before today.
     - "this week" should mean the current week including today's date.
     - "next week" should mean the full upcoming calendar week, Monday through Sunday, after the current week.
+    - "tomorrow" should mean one single day: tomorrow's date.
+    - "yesterday" should mean one single day: yesterday's date.
+    - "last month" should mean the full calendar month before today.
+    - "this month" should mean the current month including today's date.
+    - "next month" should mean the full upcoming calendar month, after the current month.
 
     Return a JSON object with fields: "start_date" and "end_date" in YYYY-MM-DD format.
     """
@@ -264,33 +269,46 @@ def meeting_summary_command(request: CommandRequest):
 def interpret_and_create_event(request: CommandRequest):
     """
     Interpret a command that includes date and time references and create a calendar event.
+    Now handles durations in both minutes and hours.
     """
     try:
         # Step 1: Detect user's time zone
-        user_timezone = get_user_timezone()  # Fetch the user's timezone dynamically
+        user_timezone = get_user_timezone()
         try:
-            user_tz = timezone(user_timezone)  # Ensure this is a valid timezone
+            user_tz = pytz.timezone(user_timezone)
         except UnknownTimeZoneError:
-            user_tz = timezone("UTC")  # Fallback to UTC if detection fails
+            user_tz = pytz.utc  # Fallback to UTC if detection fails
 
-        # Step 2: Use GPT to extract event details
         current_date = datetime.now(user_tz).strftime("%Y-%m-%d")
+
         prompt = f"""
         You are a smart assistant helping users schedule events. Interpret the following command and extract:
         1. Event title (e.g., "Gym", "Lunch with friends").
-        2. Date in YYYY-MM-DD format (e.g., 2024-12-15). Assume today's date is {current_date}.
-        3. Time in HH:MM format (e.g., 12:30). Always interpret times correctly based on the user's input.
+        2. Date in YYYY-MM-DD format (e.g., 2024-12-15) considering today's date is {current_date}.
+        3. Time in HH:MM format (e.g., 12:30).
+        4. Duration in minutes (integer). If the user specifies a duration like "15 minutes", "30 min", "2 hours", "1 hr", 
+           convert it to the total number of minutes. If no explicit duration is mentioned, default to 120 minutes.
 
-        Output the result as JSON with these fields:
-        - "title": (e.g., "Gym")
-        - "date": (YYYY-MM-DD format)
-        - "time": (HH:MM format)
+        Examples:
+        - "15 minutes" -> 15
+        - "30 min" -> 30
+        - "2 hours" or "2 hrs" -> 120
+        - "1 hour" -> 60
+        - If not mentioned, 120.
+
+        Output a JSON object:
+        {{
+          "title": "Event Title",
+          "date": "YYYY-MM-DD",
+          "time": "HH:MM",
+          "duration_minutes": integer
+        }}
 
         Only output a valid JSON object. Do not include explanations or additional text.
 
         Command: "{request.command}"
         """
-        
+
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": prompt}]
@@ -307,17 +325,20 @@ def interpret_and_create_event(request: CommandRequest):
         event_info = json.loads(json_match.group())
 
         # Validate parsed data
-        if not all(key in event_info for key in ["title", "date", "time"]):
+        required_keys = ["title", "date", "time", "duration_minutes"]
+        if not all(key in event_info for key in required_keys):
             return {"error": "Incomplete event information from GPT"}
 
-        # Step 3: Convert the extracted time to UTC
+        # Convert the extracted time to UTC
         event_time_local = datetime.strptime(
             f"{event_info['date']} {event_info['time']}", "%Y-%m-%d %H:%M"
         )
-        event_time_utc = user_tz.localize(event_time_local).astimezone(timezone("UTC"))
+        event_time_utc = user_tz.localize(event_time_local).astimezone(pytz.utc)
 
+        duration_minutes = event_info.get("duration_minutes", 120)
+        event_end_utc = event_time_utc + timedelta(minutes=duration_minutes)
         start_time = event_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_time = (event_time_utc + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")  # Default to 2-hour duration
+        end_time = event_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Step 4: Create the event in the calendar
         result = create_calendar_event(
@@ -326,7 +347,6 @@ def interpret_and_create_event(request: CommandRequest):
             end_time=end_time,
             user_timezone=user_timezone
         )
-        # Add event details to the logs
         print(f"Event Created: {result}, Start: {start_time}, End: {end_time}, Title: {event_info['title']}")
         return result
 
@@ -334,12 +354,13 @@ def interpret_and_create_event(request: CommandRequest):
         return {"error": f"Failed to interpret and create event: {str(e)}"}
 
 
+
 @app.post("/interpret-command-date-time")
 def interpret_command_date_time(request: CommandRequest):
     """
     Interpret date and time references.
     """
-    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_date = datetime.now(pytz.utc).strftime("%Y-%m-%d")
     prompt = f"""
     Interpret the following command and extract date and time references. Output JSON with:
     - "date" in YYYY-MM-DD.
