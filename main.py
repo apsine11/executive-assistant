@@ -64,66 +64,105 @@ class CommandRequest(BaseModel):
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Helper function for command classification
-def classify_command(command):
+def classify_command(command: str, attempt: int = 1) -> str:
+    """
+    Classify the command using GPT. Retries once if it fails on the first attempt.
+    Uses fallback heuristics if GPT fails or returns an unexpected response.
+    """
     prompt = f"""
     You are a helpful assistant. Classify the following command into one of the following categories:
-    - "meeting-summary" for commands asking for summaries (e.g., "What did my week look like?" or "Summarize last month").
-    - "create-event" for commands related to scheduling or creating calendar events (e.g., "Create a meeting tomorrow at 3 PM").
-    - "date-time-interpretation" for commands involving general date/time queries (e.g., "What is the date next Friday?").
-
-    Output the classification as a single string: "meeting-summary", "create-event", or "date-time-interpretation". 
-    Do not include explanations, examples, or additional text.
+    - "meeting-summary" 
+    - "create-event"
+    - "date-time-interpretation"
 
     Command: "{command}"
     """
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": prompt}]
         )
         classification = response.choices[0].message.content.strip()
+
+        # Validate classification
+        if classification not in ["meeting-summary", "create-event", "date-time-interpretation"]:
+            raise ValueError("Invalid classification returned by GPT.")
+
         return classification
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to classify command: {str(e)}")
+        print(f"GPT classification attempt {attempt} failed: {e}")
+
+        if attempt == 1:
+            # Try once more
+            return classify_command(command, attempt=2)
+        else:
+            # Apply fallback heuristic
+            return heuristic_classification(command)
+
+def heuristic_classification(command: str) -> str:
+    """
+    Basic keyword-based fallback classification if GPT fails:
+    - If command contains words like 'summarize', 'spent my time on', 'what did my week look like', classify as 'meeting-summary'
+    - If command contains words like 'create', 'schedule', 'book', classify as 'create-event'
+    - Otherwise, assume 'date-time-interpretation'
+    """
+    cmd_lower = command.lower()
+    if any(keyword in cmd_lower for keyword in ["summarize", "spent my time", "what did my week look like", "last week", "this week", "next week"]):
+        return "meeting-summary"
+    elif any(keyword in cmd_lower for keyword in ["create", "schedule", "book", "set up"]):
+        return "create-event"
+    else:
+        return "date-time-interpretation"
 
 @app.post("/parse-command")
 def parse_with_classification(request: CommandRequest):
     """
     Dynamically classify the user command and route to the appropriate endpoint.
+    Falls back to heuristic classification if GPT fails.
     """
     try:
-        # Step 1: Classify the command
         classification = classify_command(request.command)
         print(f"Classified command '{request.command}' as '{classification}'")
 
-        # Step 2: Route to the appropriate endpoint based on classification
         if classification == "meeting-summary":
-            return meeting_summary_command(request)  # Only summary logic
+            return meeting_summary_command(request)
         elif classification == "create-event":
-            return interpret_and_create_event(request)  # Only event creation logic
+            return interpret_and_create_event(request)
         elif classification == "date-time-interpretation":
-            return interpret_command_date_time(request)  # Only date/time interpretation logic
+            return interpret_command_date_time(request)
         else:
-            raise HTTPException(status_code=400, detail="Unrecognized command classification")
+            # This should never happen with the heuristic fallback in place, but just in case:
+            return {"message": "I'm having trouble understanding your request. Could you try rephrasing it?"}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing command: {str(e)}")
+        # If something unexpected happens, return a friendly message
+        print(f"Error processing command: {e}")
+        return {"error": "I'm having trouble understanding your request right now. Please try again later."}
 
 
 @app.post("/meeting-summary-command")
 def meeting_summary_command(request: CommandRequest):
     """
-    Generate a meeting summary based on user input.
+    Generate a meeting summary based on user input, handling both past and future requests.
     """
     user_timezone = get_user_timezone()
     user_tz = timezone(user_timezone)
 
     current_date = datetime.now(user_tz).strftime("%Y-%m-%d")
 
+    # Updated prompt to handle past, present, and future (including "next week")
     prompt = f"""
     You are a helpful assistant. Today's date is {current_date}.
     Parse the following command and identify the desired date range for summarizing meetings.
 
     Command: "{request.command}"
+
+    Consider that the user may ask about past or future time periods.
+    - "last week" should mean the full calendar week before today.
+    - "this week" should mean the current week including today's date.
+    - "next week" should mean the full upcoming calendar week, Monday through Sunday, after the current week.
 
     Return a JSON object with fields: "start_date" and "end_date" in YYYY-MM-DD format.
     """
@@ -132,13 +171,13 @@ def meeting_summary_command(request: CommandRequest):
             model="gpt-4o",
             messages=[{"role": "system", "content": prompt}]
         )
-
         parsed_data = response.choices[0].message.content
         print(f"Parsed Date Range: {parsed_data}")
 
         json_match = re.search(r"\{.*?\}", parsed_data, re.DOTALL)
         date_range = json.loads(json_match.group())
 
+        # Fetch events from Google Calendar for the given date range
         creds = Credentials(
             token=os.getenv("GOOGLE_ACCESS_TOKEN"),
             refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
@@ -150,10 +189,13 @@ def meeting_summary_command(request: CommandRequest):
             creds.refresh(Request())
         service = build('calendar', 'v3', credentials=creds)
 
+        start_datetime = f"{date_range['start_date']}T00:00:00Z"
+        end_datetime = f"{date_range['end_date']}T23:59:59Z"
+
         events_result = service.events().list(
             calendarId='primary',
-            timeMin=f"{date_range['start_date']}T00:00:00Z",
-            timeMax=f"{date_range['end_date']}T23:59:59Z",
+            timeMin=start_datetime,
+            timeMax=end_datetime,
             singleEvents=True,
             orderBy='startTime'
         ).execute()
@@ -168,15 +210,47 @@ def meeting_summary_command(request: CommandRequest):
             for event in events
         ])
 
-        summary_prompt = f"""
-        Summarize the following meetings:
-        {meetings_text}
+        # Determine if the date range is in the future or past
+        date_range_start = datetime.strptime(date_range["start_date"], "%Y-%m-%d").date()
+        today = datetime.now(user_tz).date()
+        
+        if date_range_start > today:
+            # Future-oriented summary
+            summary_prompt = f"""
+            You are a helpful assistant. The user wants a summary of their upcoming schedule based on the command:
 
-        Provide concise details about:
-        - Total time spent in all meetings.
-        - Number of meetings.
-        - Suggestions for improving time management.
-        """
+            User Command: "{request.command}"
+
+            Below are the meetings scheduled for the given time period:
+            {meetings_text}
+
+            Please create a natural language summary that directly addresses the user's request, focusing on the upcoming time period. 
+            Consider including:
+            - Types of meetings or activities planned.
+            - The total number of meetings and approximate total time they might spend.
+            - Any suggestions for managing their upcoming schedule.
+
+            Present it as a helpful, friendly, and conversational answer.
+            """
+        else:
+            # Past or current-oriented summary
+            summary_prompt = f"""
+            You are a helpful assistant. The user wants a summary of their meetings based on the command:
+
+            User Command: "{request.command}"
+
+            Below are the meetings we retrieved for the relevant time period:
+            {meetings_text}
+
+            Please create a natural language summary that directly addresses the user's request. Consider these guidelines:
+            - If the user asks for a general overview, provide a high-level summary of their meetings.
+            - If the user asks where they spent most of their time, highlight which activities took the majority of their schedule.
+            - If the user asks about a certain metric (like total number of meetings or total hours), include that.
+            - Provide one or two suggestions for improving time management if relevant.
+
+            Your response should be helpful, friendly, and conversational.
+            """
+
         summary_response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": summary_prompt}]
@@ -209,8 +283,8 @@ def interpret_and_create_event(request: CommandRequest):
 
         Output the result as JSON with these fields:
         - "title": (e.g., "Gym")
-        - "date": (YYYY-MM-DD format, e.g., "2024-12-09")
-        - "time": (HH:MM format, e.g., "12:30")
+        - "date": (YYYY-MM-DD format)
+        - "time": (HH:MM format)
 
         Only output a valid JSON object. Do not include explanations or additional text.
 
