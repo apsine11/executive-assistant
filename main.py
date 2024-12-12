@@ -13,38 +13,42 @@ import requests
 import json
 import re
 
-# Load environment variables
 load_dotenv()
 
-# Initialize FastAPI app
 app = FastAPI()
 
-# Helper function to detect user's timezone
+# In-memory store for pending events
+pending_events = {}
+
+class CommandRequest(BaseModel):
+    command: str
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 def get_user_timezone():
     try:
         response = requests.get("https://ipinfo.io", timeout=5)
         data = response.json()
-        return data.get("timezone", "UTC")  # Default to UTC if detection fails
+        return data.get("timezone", "UTC")
     except Exception as e:
         print(f"Time zone detection failed: {e}")
         return "UTC"
 
-# Google Calendar Helper Functions
+def build_service():
+    creds = Credentials(
+        token=os.getenv("GOOGLE_ACCESS_TOKEN"),
+        refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET")
+    )
+    if creds.expired:
+        creds.refresh(Request())
+    return build('calendar', 'v3', credentials=creds)
+
 def create_calendar_event(summary, start_time, end_time, user_timezone):
     try:
-        creds = Credentials(
-            token=os.getenv("GOOGLE_ACCESS_TOKEN"),
-            refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.getenv("GOOGLE_CLIENT_ID"),
-            client_secret=os.getenv("GOOGLE_CLIENT_SECRET")
-        )
-
-        if creds.expired:
-            creds.refresh(Request())
-
-        service = build('calendar', 'v3', credentials=creds)
-
+        service = build_service()
         event = {
             'summary': summary,
             'start': {'dateTime': start_time, 'timeZone': user_timezone},
@@ -56,72 +60,49 @@ def create_calendar_event(summary, start_time, end_time, user_timezone):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# Request Schema for Commands
-class CommandRequest(BaseModel):
-    command: str
-
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Helper function for command classification
 def classify_command(command: str, attempt: int = 1) -> str:
-    """
-    Classify the command using GPT. Retries once if it fails on the first attempt.
-    Uses fallback heuristics if GPT fails or returns an unexpected response.
-    """
     prompt = f"""
-    You are a helpful assistant. Classify the following command into one of the following categories:
-    - "meeting-summary" 
+    You are a helpful assistant. Classify the following command into one of these categories:
+    - "meeting-summary"
     - "create-event"
     - "date-time-interpretation"
+    - "confirmation" (for user responses like "Yes", "No", "That works", "Please schedule")
 
     Command: "{command}"
     """
-
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "system", "content": prompt}]
         )
         classification = response.choices[0].message.content.strip()
-
-        # Validate classification
-        if classification not in ["meeting-summary", "create-event", "date-time-interpretation"]:
+        if classification not in ["meeting-summary", "create-event", "date-time-interpretation", "confirmation"]:
             raise ValueError("Invalid classification returned by GPT.")
-
         return classification
-
     except Exception as e:
         print(f"GPT classification attempt {attempt} failed: {e}")
-
         if attempt == 1:
-            # Try once more
             return classify_command(command, attempt=2)
         else:
-            # Apply fallback heuristic
             return heuristic_classification(command)
 
 def heuristic_classification(command: str) -> str:
-    """
-    Basic keyword-based fallback classification if GPT fails:
-    - If command contains words like 'summarize', 'spent my time on', 'what did my week look like', classify as 'meeting-summary'
-    - If command contains words like 'create', 'schedule', 'book', classify as 'create-event'
-    - Otherwise, assume 'date-time-interpretation'
-    """
     cmd_lower = command.lower()
-    if any(keyword in cmd_lower for keyword in ["summarize", "spent my time", "spend my time", "what did my week look like", "last week", "this week", "next week", "this month", "last month", "look like"]):
+    if any(keyword in cmd_lower for keyword in [
+        "summarize", "spent my time", "spend my time",
+        "what did my week look like", "last week", "this week", "next week", 
+        "this month", "last month", "look like"
+    ]):
         return "meeting-summary"
     elif any(keyword in cmd_lower for keyword in ["create", "schedule", "book", "set up", "block"]):
         return "create-event"
+    elif cmd_lower in ["yes", "no", "sure", "okay", "that works", "please schedule", "ok", "no thanks", "not good"]:
+        return "confirmation"
     else:
         return "date-time-interpretation"
 
 @app.post("/parse-command")
 def parse_with_classification(request: CommandRequest):
-    """
-    Dynamically classify the user command and route to the appropriate endpoint.
-    Falls back to heuristic classification if GPT fails.
-    """
     try:
         classification = classify_command(request.command)
         print(f"Classified command '{request.command}' as '{classification}'")
@@ -130,16 +111,118 @@ def parse_with_classification(request: CommandRequest):
             return meeting_summary_command(request)
         elif classification == "create-event":
             return interpret_and_create_event(request)
+        elif classification == "confirmation":
+            return handle_confirmation(request)
         elif classification == "date-time-interpretation":
             return interpret_command_date_time(request)
         else:
-            # This should never happen with the heuristic fallback in place, but just in case:
             return {"message": "I'm having trouble understanding your request. Could you try rephrasing it?"}
 
     except Exception as e:
-        # If something unexpected happens, return a friendly message
         print(f"Error processing command: {e}")
         return {"error": "I'm having trouble understanding your request right now. Please try again later."}
+
+def classify_user_response(response: str) -> str:
+    """
+    Classify user response into 'affirmation', 'rejection', or 'unclear'.
+    """
+    prompt = f"""
+    You are a helpful assistant. Classify the user's response into one of three categories:
+    - "affirmation" if the user indicates agreement or acceptance (e.g. "Yes", "That works", "Please schedule", "Sure", "Ok")
+    - "rejection" if the user indicates disagreement or refusal (e.g. "No", "Not good", "Doesn't work", "No thanks")
+    - "unclear" if it's not clear whether the user accepts or rejects.
+
+    User response: "{response}"
+    """
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": prompt}]
+        )
+        classification = resp.choices[0].message.content.strip().lower()
+        if classification not in ["affirmation", "rejection", "unclear"]:
+            classification = "unclear"
+        return classification
+    except:
+        # Fallback heuristic if GPT call fails
+        resp_lower = response.lower()
+        if any(word in resp_lower for word in ["yes", "sure", "ok", "that works", "please schedule"]):
+            return "affirmation"
+        elif any(word in resp_lower for word in ["no", "not good", "doesn't work", "nah", "no thanks"]):
+            return "rejection"
+        else:
+            return "unclear"
+
+def handle_confirmation(request: CommandRequest):
+    user_id = "default_user"
+    if user_id not in pending_events:
+        return {"message": "There's nothing pending to confirm."}
+
+    event_data = pending_events[user_id]
+    classification = classify_user_response(request.command)
+
+    if classification == "affirmation":
+        # Schedule the event (either overlapping or the suggested time)
+        result = create_calendar_event(
+            summary=event_data["title"],
+            start_time=event_data["start_time"],
+            end_time=event_data["end_time"],
+            user_timezone=event_data["user_timezone"]
+        )
+        del pending_events[user_id]
+        if result.get("success"):
+            local_time_str = convert_utc_to_local(event_data["start_time"], event_data["user_timezone"])
+            return {"message": f"Scheduled '{event_data['title']}' on {local_time_str}"}
+        else:
+            return {"error": "Failed to schedule event."}
+    elif classification == "rejection":
+        # User rejects the suggestion, try another time
+        return suggest_alternative_time(event_data)
+    else:
+        return {"message": "I didn't understand your response. Would you like to schedule anyway or find another time?"}
+
+def suggest_alternative_time(event_data):
+    user_id = "default_user"
+    user_timezone = event_data["user_timezone"]
+    user_tz = pytz.timezone(user_timezone)
+    duration_minutes = event_data["duration_minutes"]
+    service = build_service()
+
+    increments_tried = event_data.get("increments_tried", 0)
+    event_start_utc = datetime.strptime(event_data["start_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
+    increment = timedelta(minutes=30)
+    suggested_start = event_start_utc + increment*(increments_tried+1)
+
+    while True:
+        suggested_end = suggested_start + timedelta(minutes=duration_minutes)
+        check_result = service.events().list(
+            calendarId='primary',
+            timeMin=suggested_start.isoformat(),
+            timeMax=suggested_end.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        if not check_result.get('items', []):
+            # Found a free slot
+            local_suggested_str = convert_utc_to_local(suggested_start.strftime("%Y-%m-%dT%H:%M:%SZ"), user_timezone)
+            event_data["start_time"] = suggested_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+            event_data["end_time"] = suggested_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+            event_data["increments_tried"] = increments_tried + 1
+            pending_events[user_id] = event_data
+            return {"message": f"Your requested time was booked. How about {local_suggested_str}?"}
+
+        suggested_start += increment
+        increments_tried += 1
+
+        if increments_tried > 10:
+            return {"message": "I'm having trouble finding a free slot. Please try a different time."}
+
+def convert_utc_to_local(utc_str, user_timezone):
+    utc_time = datetime.strptime(utc_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
+    user_tz = pytz.timezone(user_timezone)
+    local_time = utc_time.astimezone(user_tz)
+    return local_time.strftime("%m/%d/%Y at %I:%M %p %Z")
 
 
 @app.post("/meeting-summary-command")
@@ -265,38 +348,26 @@ def meeting_summary_command(request: CommandRequest):
     except Exception as e:
         return {"error": f"Failed to generate meeting summary: {str(e)}"}
 
+
 @app.post("/interpret-and-create-event")
 def interpret_and_create_event(request: CommandRequest):
-    """
-    Interpret a command that includes date and time references and create a calendar event.
-    Now handles durations in both minutes and hours.
-    """
     try:
-        # Step 1: Detect user's time zone
         user_timezone = get_user_timezone()
         try:
             user_tz = pytz.timezone(user_timezone)
         except UnknownTimeZoneError:
-            user_tz = pytz.utc  # Fallback to UTC if detection fails
+            user_tz = pytz.utc
 
         current_date = datetime.now(user_tz).strftime("%Y-%m-%d")
 
         prompt = f"""
         You are a smart assistant helping users schedule events. Interpret the following command and extract:
-        1. Event title (e.g., "Gym", "Lunch with friends").
-        2. Date in YYYY-MM-DD format (e.g., 2024-12-15) considering today's date is {current_date}.
-        3. Time in HH:MM format (e.g., 12:30).
-        4. Duration in minutes (integer). If the user specifies a duration like "15 minutes", "30 min", "2 hours", "1 hr", 
-           convert it to the total number of minutes. If no explicit duration is mentioned, default to 120 minutes.
+        1. Event title
+        2. Date (YYYY-MM-DD) considering today's date is {current_date}
+        3. Time (HH:MM)
+        4. Duration in minutes (if mentioned, else 30)
 
-        Examples:
-        - "15 minutes" -> 15
-        - "30 min" -> 30
-        - "2 hours" or "2 hrs" -> 120
-        - "1 hour" -> 60
-        - If not mentioned, 120.
-
-        Output a JSON object:
+        Only output a valid JSON object with fields:
         {{
           "title": "Event Title",
           "date": "YYYY-MM-DD",
@@ -304,7 +375,7 @@ def interpret_and_create_event(request: CommandRequest):
           "duration_minutes": integer
         }}
 
-        Only output a valid JSON object. Do not include explanations or additional text.
+        No extra text or comments.
 
         Command: "{request.command}"
         """
@@ -317,38 +388,55 @@ def interpret_and_create_event(request: CommandRequest):
         parsed_data = response.choices[0].message.content.strip()
         print("GPT Parsed Data:", parsed_data)
 
-        # Extract JSON from GPT response
         json_match = re.search(r"\{.*?\}", parsed_data, re.DOTALL)
         if not json_match:
             return {"error": "Failed to parse valid JSON from GPT response"}
 
         event_info = json.loads(json_match.group())
-
-        # Validate parsed data
-        required_keys = ["title", "date", "time", "duration_minutes"]
-        if not all(key in event_info for key in required_keys):
+        if not all(k in event_info for k in ["title", "date", "time", "duration_minutes"]):
             return {"error": "Incomplete event information from GPT"}
 
-        # Convert the extracted time to UTC
-        event_time_local = datetime.strptime(
-            f"{event_info['date']} {event_info['time']}", "%Y-%m-%d %H:%M"
-        )
+        event_time_local = datetime.strptime(f"{event_info['date']} {event_info['time']}", "%Y-%m-%d %H:%M")
         event_time_utc = user_tz.localize(event_time_local).astimezone(pytz.utc)
 
-        duration_minutes = event_info.get("duration_minutes", 120)
+        duration_minutes = event_info["duration_minutes"]
         event_end_utc = event_time_utc + timedelta(minutes=duration_minutes)
-        start_time = event_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_time = event_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Step 4: Create the event in the calendar
-        result = create_calendar_event(
-            summary=event_info["title"],
-            start_time=start_time,
-            end_time=end_time,
-            user_timezone=user_timezone
-        )
-        print(f"Event Created: {result}, Start: {start_time}, End: {end_time}, Title: {event_info['title']}")
-        return result
+        start_time_google = event_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_time_google = event_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Check for conflicts
+        service = build_service()
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=start_time_google,
+            timeMax=end_time_google,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        overlapping_events = events_result.get('items', [])
+
+        if overlapping_events:
+            # Store event details and prompt user for confirmation
+            user_id = "default_user"
+            pending_events[user_id] = {
+                "title": event_info["title"],
+                "start_time": start_time_google,
+                "end_time": end_time_google,
+                "user_timezone": user_timezone,
+                "duration_minutes": duration_minutes
+            }
+            return {"message": "There's an overlap with another event. Would you still like to schedule it?"}
+        else:
+            # No conflicts, schedule the event immediately
+            result = create_calendar_event(
+                summary=event_info["title"],
+                start_time=start_time_google,
+                end_time=end_time_google,
+                user_timezone=user_timezone
+            )
+            return result
 
     except Exception as e:
         return {"error": f"Failed to interpret and create event: {str(e)}"}
@@ -382,3 +470,4 @@ def interpret_command_date_time(request: CommandRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
